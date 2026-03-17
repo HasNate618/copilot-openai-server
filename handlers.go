@@ -95,7 +95,10 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var systemMessageParts []string
 	for _, msg := range req.Messages {
 		if msg.Role == "system" || msg.Role == "developer" {
-			systemMessageParts = append(systemMessageParts, msg.Content)
+			content := msg.Content.String()
+			if content != "" {
+				systemMessageParts = append(systemMessageParts, content)
+			}
 		}
 	}
 
@@ -127,6 +130,10 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
+	if effort := normalizeReasoningEffort(req.ReasoningEffort); effort != "" {
+		sessionConfig.ReasoningEffort = effort
+	}
+
 	// Add system message if present
 	if len(systemMessageParts) > 0 {
 		systemContent := strings.Join(systemMessageParts, "\n\n")
@@ -139,11 +146,7 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// If tools are provided, limit available tools to only our custom ones
 	if len(copilotTools) > 0 {
-		toolNames := make([]string, len(copilotTools))
-		for i, t := range copilotTools {
-			toolNames[i] = t.Name
-		}
-		sessionConfig.AvailableTools = toolNames
+		sessionConfig.AvailableTools = determineAvailableTools(req.Tools, req.ToolChoice)
 	}
 
 	// Create session
@@ -238,7 +241,7 @@ func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, ctx context.C
 				Index: 0,
 				Message: &Message{
 					Role:      "assistant",
-					Content:   contentBuilder.String(),
+					Content:   MessageContent{Text: contentBuilder.String()},
 					ToolCalls: toolCalls,
 				},
 				FinishReason: &finishReason,
@@ -299,7 +302,7 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, ctx context.Cont
 		case copilot.AssistantMessageDelta:
 			// Stream content deltas
 			if event.Data.DeltaContent != nil {
-				sendChunk(Message{Content: *event.Data.DeltaContent}, nil)
+				sendChunk(Message{Content: MessageContent{Text: *event.Data.DeltaContent}}, nil)
 			}
 
 		case copilot.AssistantMessage:
@@ -397,24 +400,114 @@ func buildPrompt(messages []Message) string {
 	var parts []string
 
 	for _, msg := range messages {
+		content := msg.Content.String()
 		switch msg.Role {
 		case "system", "developer":
 			continue
 		case "user":
-			parts = append(parts, fmt.Sprintf("[User]: %s", msg.Content))
+			parts = append(parts, fmt.Sprintf("[User]: %s", content))
 		case "assistant":
-			if msg.Content != "" {
-				parts = append(parts, fmt.Sprintf("[Assistant]: %s", msg.Content))
+			if content != "" {
+				parts = append(parts, fmt.Sprintf("[Assistant]: %s", content))
 			}
 			for _, tc := range msg.ToolCalls {
 				parts = append(parts, fmt.Sprintf("[Assistant called tool %s with args: %s]", tc.Function.Name, tc.Function.Arguments))
 			}
 		case "tool":
-			parts = append(parts, fmt.Sprintf("[Tool result for %s]: %s", msg.ToolCallID, msg.Content))
+			parts = append(parts, fmt.Sprintf("[Tool result for %s]: %s", msg.ToolCallID, content))
 		}
 	}
 
 	return strings.Join(parts, "\n\n")
+}
+
+func normalizeReasoningEffort(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "low", "medium", "high", "xhigh":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
+}
+
+func determineAvailableTools(tools []Tool, toolChoice interface{}) []string {
+	toolNames := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		if tool.Type == "function" && tool.Function.Name != "" {
+			toolNames = append(toolNames, tool.Function.Name)
+		}
+	}
+
+	if len(toolNames) == 0 {
+		return nil
+	}
+
+	if toolChoice == nil {
+		return toolNames
+	}
+
+	switch choice := toolChoice.(type) {
+	case string:
+		switch choice {
+		case "none":
+			return []string{}
+		case "auto", "required", "":
+			return toolNames
+		}
+	case map[string]interface{}:
+		if toolName := extractNamedToolChoice(choice); toolName != "" {
+			return []string{toolName}
+		}
+		if allowed := extractAllowedTools(choice); len(allowed) > 0 {
+			return allowed
+		}
+	}
+
+	return toolNames
+}
+
+func extractNamedToolChoice(choice map[string]interface{}) string {
+	if choiceType, _ := choice["type"].(string); choiceType != "function" {
+		return ""
+	}
+
+	function, ok := choice["function"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+
+	name, _ := function["name"].(string)
+	return name
+}
+
+func extractAllowedTools(choice map[string]interface{}) []string {
+	if choiceType, _ := choice["type"].(string); choiceType != "allowed_tools" {
+		return nil
+	}
+
+	allowedTools, ok := choice["allowed_tools"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	rawTools, ok := allowedTools["tools"].([]interface{})
+	if !ok {
+		return nil
+	}
+
+	toolNames := make([]string, 0, len(rawTools))
+	for _, rawTool := range rawTools {
+		toolMap, ok := rawTool.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name := extractNamedToolChoice(toolMap)
+		if name != "" {
+			toolNames = append(toolNames, name)
+		}
+	}
+
+	return toolNames
 }
 
 // writeJSON writes a JSON response
