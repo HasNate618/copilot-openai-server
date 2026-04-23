@@ -10,22 +10,22 @@ import (
 
 // ChatCompletionRequest represents an OpenAI chat completion request
 type ChatCompletionRequest struct {
-	Model            string      `json:"model"`
-	Messages         []Message   `json:"messages"`
-	Temperature      *float64    `json:"temperature,omitempty"`
-	TopP             *float64    `json:"top_p,omitempty"`
-	N                *int        `json:"n,omitempty"`
-	Stream           bool        `json:"stream"`
-	StreamOptions    *StreamOptions `json:"stream_options,omitempty"`
-	Stop             interface{} `json:"stop,omitempty"`
-	MaxCompletionTokens *int     `json:"max_completion_tokens,omitempty"`
-	MaxTokens        *int        `json:"max_tokens,omitempty"`
-	PresencePenalty  *float64    `json:"presence_penalty,omitempty"`
-	FrequencyPenalty *float64    `json:"frequency_penalty,omitempty"`
-	ReasoningEffort  string      `json:"reasoning_effort,omitempty"`
-	Tools            []Tool      `json:"tools,omitempty"`
-	ToolChoice       interface{} `json:"tool_choice,omitempty"`
-	User             string      `json:"user,omitempty"`
+	Model               string         `json:"model"`
+	Messages            []Message      `json:"messages"`
+	Temperature         *float64       `json:"temperature,omitempty"`
+	TopP                *float64       `json:"top_p,omitempty"`
+	N                   *int           `json:"n,omitempty"`
+	Stream              bool           `json:"stream"`
+	StreamOptions       *StreamOptions `json:"stream_options,omitempty"`
+	Stop                interface{}    `json:"stop,omitempty"`
+	MaxCompletionTokens *int           `json:"max_completion_tokens,omitempty"`
+	MaxTokens           *int           `json:"max_tokens,omitempty"`
+	PresencePenalty     *float64       `json:"presence_penalty,omitempty"`
+	FrequencyPenalty    *float64       `json:"frequency_penalty,omitempty"`
+	ReasoningEffort     string         `json:"reasoning_effort,omitempty"`
+	Tools               []Tool         `json:"tools,omitempty"`
+	ToolChoice          interface{}    `json:"tool_choice,omitempty"`
+	User                string         `json:"user,omitempty"`
 }
 
 // StreamOptions represents chat-completions streaming options.
@@ -35,11 +35,14 @@ type StreamOptions struct {
 
 // Message represents a chat message
 type Message struct {
-	Role       string         `json:"role,omitempty"`
-	Content    MessageContent `json:"content,omitempty"`
-	Name       string         `json:"name,omitempty"`
-	ToolCalls  []ToolCall     `json:"tool_calls,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
+	Role    string         `json:"role,omitempty"`
+	Content MessageContent `json:"content,omitempty"`
+	// Reasoning carries model reasoning text when provided by the Copilot SDK
+	// (assistant.reasoning / assistant.reasoning_delta). Optional.
+	Reasoning  string     `json:"reasoning,omitempty"`
+	Name       string     `json:"name,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
 // MessageContent supports both string and structured OpenAI content arrays.

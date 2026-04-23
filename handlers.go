@@ -120,9 +120,9 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Create session config
 	sessionConfig := &copilot.SessionConfig{
-		Model:     req.Model,
-		Streaming: req.Stream,
-		Tools:     copilotTools,
+		Model:               req.Model,
+		Streaming:           req.Stream,
+		Tools:               copilotTools,
 		OnPermissionRequest: copilot.PermissionHandler.ApproveAll,
 		// Disable infinite sessions for simple request/response
 		InfiniteSessions: &copilot.InfiniteSessionConfig{
@@ -171,6 +171,7 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 // handleNonStreamingResponse handles non-streaming chat completions
 func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, ctx context.Context, session *copilot.Session, prompt, model string) {
 	var contentBuilder strings.Builder
+	var reasoningBuilder strings.Builder
 	var toolCalls []ToolCall
 	var finishReason string = "stop"
 
@@ -198,6 +199,13 @@ func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, ctx context.C
 			// Capture final content
 			if event.Data.Content != nil {
 				contentBuilder.WriteString(*event.Data.Content)
+			}
+
+		case copilot.AssistantReasoning:
+			if event.Data.Content != nil {
+				reasoningBuilder.WriteString(*event.Data.Content)
+			} else if event.Data.ReasoningText != nil {
+				reasoningBuilder.WriteString(*event.Data.ReasoningText)
 			}
 
 		case copilot.SessionIdle:
@@ -242,6 +250,7 @@ func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, ctx context.C
 				Message: &Message{
 					Role:      "assistant",
 					Content:   MessageContent{Text: contentBuilder.String()},
+					Reasoning: reasoningBuilder.String(),
 					ToolCalls: toolCalls,
 				},
 				FinishReason: &finishReason,
@@ -270,6 +279,9 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, ctx context.Cont
 	done := make(chan bool)
 	var toolCalls []ToolCall
 	var mu sync.Mutex
+	var sawStructuredStreamDeltas bool
+	var sawMessageStream bool
+	var sawReasoningStream bool
 
 	sendChunk := func(delta Message, finishReason *string) {
 		chunk := ChatCompletionChunk{
@@ -300,9 +312,51 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, ctx context.Cont
 	session.On(func(event copilot.SessionEvent) {
 		switch event.Type {
 		case copilot.AssistantMessageDelta:
+			sawStructuredStreamDeltas = true
+			sawMessageStream = true
 			// Stream content deltas
 			if event.Data.DeltaContent != nil {
 				sendChunk(Message{Content: MessageContent{Text: *event.Data.DeltaContent}}, nil)
+			}
+
+		case copilot.AssistantReasoningDelta:
+			sawStructuredStreamDeltas = true
+			sawReasoningStream = true
+			if event.Data.DeltaContent != nil {
+				sendChunk(Message{Reasoning: *event.Data.DeltaContent}, nil)
+			}
+
+		case copilot.AssistantStreamingDelta:
+			// Some providers emit generic phased deltas; avoid duplicates when
+			// structured message/reasoning deltas are already available.
+			if sawStructuredStreamDeltas {
+				break
+			}
+			if event.Data.DeltaContent != nil {
+				phase := ""
+				if event.Data.Phase != nil {
+					phase = strings.ToLower(strings.TrimSpace(*event.Data.Phase))
+				}
+				switch phase {
+				case "thinking", "reasoning":
+					sawReasoningStream = true
+					sendChunk(Message{Reasoning: *event.Data.DeltaContent}, nil)
+				default:
+					sawMessageStream = true
+					sendChunk(Message{Content: MessageContent{Text: *event.Data.DeltaContent}}, nil)
+				}
+			}
+
+		case copilot.AssistantReasoning:
+			// Fallback for providers that only send final reasoning and no deltas.
+			if !sawReasoningStream {
+				if event.Data.Content != nil && *event.Data.Content != "" {
+					sawReasoningStream = true
+					sendChunk(Message{Reasoning: *event.Data.Content}, nil)
+				} else if event.Data.ReasoningText != nil && *event.Data.ReasoningText != "" {
+					sawReasoningStream = true
+					sendChunk(Message{Reasoning: *event.Data.ReasoningText}, nil)
+				}
 			}
 
 		case copilot.AssistantMessage:
@@ -314,6 +368,11 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, ctx context.Cont
 					}
 					return 0
 				}())
+			// Fallback for providers that only send final assistant message and no deltas.
+			if !sawMessageStream && event.Data.Content != nil && *event.Data.Content != "" {
+				sawMessageStream = true
+				sendChunk(Message{Content: MessageContent{Text: *event.Data.Content}}, nil)
+			}
 			// Check for tool requests
 			if len(event.Data.ToolRequests) > 0 {
 				log.Printf("[DEBUG] Tool calls found - streaming to client incrementally")
