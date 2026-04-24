@@ -166,18 +166,21 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	if req.Stream {
 		log.Printf("[DEBUG] Starting streaming response")
-		s.handleStreamingResponse(w, r.Context(), session, prompt, req.Model, req.Messages)
+		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+		s.handleStreamingResponse(w, r.Context(), session, prompt, req.Model, req.Messages, includeUsage)
 	} else {
 		log.Printf("[DEBUG] Starting non-streaming response")
-		s.handleNonStreamingResponse(w, r.Context(), session, prompt, req.Model, req.Messages)
+		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+		s.handleNonStreamingResponse(w, r.Context(), session, prompt, req.Model, req.Messages, includeUsage)
 	}
 }
 
 // handleNonStreamingResponse handles non-streaming chat completions
-func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, ctx context.Context, session *copilot.Session, prompt, model string, messages []Message) {
+func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, ctx context.Context, session *copilot.Session, prompt, model string, messages []Message, includeUsage bool) {
 	var contentBuilder strings.Builder
 	var reasoningBuilder strings.Builder
 	var toolCalls []ToolCall
+	var usage *Usage
 	var finishReason string = "stop"
 
 	done := make(chan bool)
@@ -221,6 +224,9 @@ func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, ctx context.C
 				log.Printf("Session error: %s", *event.Data.Message)
 			}
 			closeOnce.Do(func() { close(done) })
+
+		case copilot.AssistantUsage:
+			usage = usageFromEvent(event)
 		}
 	})
 
@@ -273,13 +279,14 @@ func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, ctx context.C
 				FinishReason: &finishReason,
 			},
 		},
+		Usage: usage,
 	}
 
 	writeJSON(w, http.StatusOK, response)
 }
 
 // handleStreamingResponse handles streaming chat completions with SSE
-func (s *Server) handleStreamingResponse(w http.ResponseWriter, ctx context.Context, session *copilot.Session, prompt, model string, messages []Message) {
+func (s *Server) handleStreamingResponse(w http.ResponseWriter, ctx context.Context, session *copilot.Session, prompt, model string, messages []Message, includeUsage bool) {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -299,6 +306,7 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, ctx context.Cont
 	var sawStructuredStreamDeltas bool
 	var sawMessageStream bool
 	var sawReasoningStream bool
+	var usage *Usage
 
 	sendChunk := func(delta Message, finishReason *string) {
 		chunk := ChatCompletionChunk{
@@ -437,6 +445,11 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, ctx context.Cont
 				log.Printf("[DEBUG] SessionError: %s", *event.Data.Message)
 			}
 			closeOnce.Do(func() { close(done) })
+
+		case copilot.AssistantUsage:
+			if includeUsage {
+				usage = usageFromEvent(event)
+			}
 		}
 	})
 
@@ -475,11 +488,46 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, ctx context.Cont
 	} else {
 		sendChunk(Message{}, strPtr("stop"))
 	}
+	if includeUsage && usage != nil {
+		chunk := ChatCompletionChunk{
+			ID:      completionID,
+			Object:  "chat.completion.chunk",
+			Created: currentTimestamp(),
+			Model:   model,
+			Choices: []Choice{},
+			Usage:   usage,
+		}
+		data, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
 	mu.Unlock()
 
 	// Send [DONE]
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+func usageFromEvent(event copilot.SessionEvent) *Usage {
+	if event.Data.InputTokens == nil && event.Data.OutputTokens == nil && event.Data.CacheReadTokens == nil && event.Data.CacheWriteTokens == nil {
+		return nil
+	}
+
+	usage := &Usage{}
+	if event.Data.InputTokens != nil {
+		usage.PromptTokens = int(*event.Data.InputTokens)
+	}
+	if event.Data.OutputTokens != nil {
+		usage.CompletionTokens = int(*event.Data.OutputTokens)
+	}
+	if event.Data.CacheReadTokens != nil {
+		usage.PromptTokens += int(*event.Data.CacheReadTokens)
+	}
+	if event.Data.CacheWriteTokens != nil {
+		usage.CompletionTokens += int(*event.Data.CacheWriteTokens)
+	}
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	return usage
 }
 
 // buildPrompt converts OpenAI messages to a single prompt string
