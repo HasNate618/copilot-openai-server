@@ -47,7 +47,8 @@ type Message struct {
 
 // MessageContent supports both string and structured OpenAI content arrays.
 type MessageContent struct {
-	Text string `json:"-"`
+	Text  string        `json:"-"`
+	Parts []ContentPart `json:"-"`
 }
 
 // String returns a plain-text representation of the content.
@@ -90,6 +91,7 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 	}
 
 	c.Text = builder.String()
+	c.Parts = parts // retain structured parts so callers can create attachments
 	return nil
 }
 

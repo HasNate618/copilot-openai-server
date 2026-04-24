@@ -2,10 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -161,15 +166,15 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	if req.Stream {
 		log.Printf("[DEBUG] Starting streaming response")
-		s.handleStreamingResponse(w, r.Context(), session, prompt, req.Model)
+		s.handleStreamingResponse(w, r.Context(), session, prompt, req.Model, req.Messages)
 	} else {
 		log.Printf("[DEBUG] Starting non-streaming response")
-		s.handleNonStreamingResponse(w, r.Context(), session, prompt, req.Model)
+		s.handleNonStreamingResponse(w, r.Context(), session, prompt, req.Model, req.Messages)
 	}
 }
 
 // handleNonStreamingResponse handles non-streaming chat completions
-func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, ctx context.Context, session *copilot.Session, prompt, model string) {
+func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, ctx context.Context, session *copilot.Session, prompt, model string, messages []Message) {
 	var contentBuilder strings.Builder
 	var reasoningBuilder strings.Builder
 	var toolCalls []ToolCall
@@ -219,9 +224,21 @@ func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, ctx context.C
 		}
 	})
 
+	// Build attachments from any structured message parts
+	attachments, cleanup, err := buildAttachmentsFromMessages(messages)
+	if err != nil {
+		log.Printf("Error building attachments: %v", err)
+		writeError(w, http.StatusInternalServerError, "Failed to prepare attachments", "api_error")
+		return
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
 	// Send the message
-	_, err := session.Send(ctx, copilot.MessageOptions{
-		Prompt: prompt,
+	_, err = session.Send(ctx, copilot.MessageOptions{
+		Prompt:      prompt,
+		Attachments: attachments,
 	})
 	if err != nil {
 		log.Printf("Error sending message: %v", err)
@@ -262,7 +279,7 @@ func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, ctx context.C
 }
 
 // handleStreamingResponse handles streaming chat completions with SSE
-func (s *Server) handleStreamingResponse(w http.ResponseWriter, ctx context.Context, session *copilot.Session, prompt, model string) {
+func (s *Server) handleStreamingResponse(w http.ResponseWriter, ctx context.Context, session *copilot.Session, prompt, model string, messages []Message) {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -423,9 +440,20 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, ctx context.Cont
 		}
 	})
 
+	// Build attachments from any structured message parts
+	attachments, cleanup, err := buildAttachmentsFromMessages(messages)
+	if err != nil {
+		log.Printf("Error building attachments: %v", err)
+		return
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
 	// Send the message
-	_, err := session.Send(ctx, copilot.MessageOptions{
-		Prompt: prompt,
+	_, err = session.Send(ctx, copilot.MessageOptions{
+		Prompt:      prompt,
+		Attachments: attachments,
 	})
 	if err != nil {
 		log.Printf("Error sending message: %v", err)
@@ -487,6 +515,129 @@ func normalizeReasoningEffort(value string) string {
 	default:
 		return ""
 	}
+}
+
+// buildAttachmentsFromMessages inspects structured message parts and returns copilot attachments.
+// It returns a cleanup function that should be called to remove any temporary files created.
+func buildAttachmentsFromMessages(messages []Message) ([]copilot.Attachment, func(), error) {
+	var attachments []copilot.Attachment
+	var tmpFiles []string
+
+	cleanup := func() {
+		for _, f := range tmpFiles {
+			os.Remove(f)
+		}
+	}
+
+	for _, msg := range messages {
+		for _, part := range msg.Content.Parts {
+			switch part.Type {
+			case "file":
+				if part.File != nil {
+					// If file_data is present, write to tmp file
+					if part.File.FileData != "" {
+						data, err := base64.StdEncoding.DecodeString(part.File.FileData)
+						if err != nil {
+							log.Printf("Failed to decode base64 file data: %v", err)
+							continue
+						}
+						tmp, err := os.CreateTemp("", "copilot-attachment-*")
+						if err != nil {
+							log.Printf("Failed to create temp file: %v", err)
+							continue
+						}
+						if _, err := tmp.Write(data); err != nil {
+							tmp.Close()
+							os.Remove(tmp.Name())
+							log.Printf("Failed to write temp file: %v", err)
+							continue
+						}
+						tmp.Close()
+						tmpFiles = append(tmpFiles, tmp.Name())
+						display := part.File.Filename
+						if display == "" {
+							display = filepath.Base(tmp.Name())
+						}
+						p := tmp.Name()
+						attachments = append(attachments, copilot.Attachment{
+							DisplayName: &display,
+							Path:        &p,
+							Type:        copilot.File,
+						})
+					} else if part.File.FileID != "" {
+						// If a file_id is present, treat as a URL reference for now
+						// Attempt to parse as URL and download if valid
+						if u, err := url.Parse(part.File.FileID); err == nil && u.Scheme != "" {
+							// download
+							resp, err := http.Get(part.File.FileID)
+							if err != nil {
+								log.Printf("Failed to download file from %s: %v", part.File.FileID, err)
+								continue
+							}
+							defer resp.Body.Close()
+							tmp, err := os.CreateTemp("", "copilot-attachment-*")
+							if err != nil {
+								log.Printf("Failed to create temp file: %v", err)
+								continue
+							}
+							if _, err := io.Copy(tmp, resp.Body); err != nil {
+								tmp.Close()
+								os.Remove(tmp.Name())
+								log.Printf("Failed to write temp file: %v", err)
+								continue
+							}
+							tmp.Close()
+							tmpFiles = append(tmpFiles, tmp.Name())
+							display := part.File.Filename
+							if display == "" {
+								display = filepath.Base(tmp.Name())
+							}
+							p := tmp.Name()
+							attachments = append(attachments, copilot.Attachment{
+								DisplayName: &display,
+								Path:        &p,
+								Type:        copilot.File,
+							})
+						}
+					}
+				}
+			case "image_url":
+				if part.ImageURL != nil && part.ImageURL.URL != "" {
+					// download image to temp file
+					if u, err := url.Parse(part.ImageURL.URL); err == nil && u.Scheme != "" {
+						resp, err := http.Get(part.ImageURL.URL)
+						if err != nil {
+							log.Printf("Failed to download image %s: %v", part.ImageURL.URL, err)
+							continue
+						}
+						defer resp.Body.Close()
+						tmp, err := os.CreateTemp("", "copilot-image-*")
+						if err != nil {
+							log.Printf("Failed to create temp file: %v", err)
+							continue
+						}
+						if _, err := io.Copy(tmp, resp.Body); err != nil {
+							tmp.Close()
+							os.Remove(tmp.Name())
+							log.Printf("Failed to write temp image: %v", err)
+							continue
+						}
+						tmp.Close()
+						tmpFiles = append(tmpFiles, tmp.Name())
+						display := filepath.Base(u.Path)
+						p := tmp.Name()
+						attachments = append(attachments, copilot.Attachment{
+							DisplayName: &display,
+							Path:        &p,
+							Type:        copilot.File,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	return attachments, func() { cleanup() }, nil
 }
 
 func determineAvailableTools(tools []Tool, toolChoice interface{}) []string {
